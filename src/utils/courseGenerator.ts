@@ -444,8 +444,10 @@ function findPlaceForTime(
   mealWindows: MealWindows | undefined,
   transport: Transport,
   baseDuration: number,
-  maxEndTime?: Date | null
-): { place: Place; distanceKm: number; startAt: Date; endAt: Date } | null {
+  maxEndTime: Date | null,
+  hasHadLunch: boolean,
+  hasHadDinner: boolean
+): { place: Place; distanceKm: number; startAt: Date; endAt: Date; isMeal: boolean } | null {
   const currentMinutes = minutesSinceMidnight(currentTime);
   const lunchWindow = mealWindows?.lunch ?? DEFAULT_LUNCH_WINDOW;
   const dinnerWindow = mealWindows?.dinner ?? DEFAULT_DINNER_WINDOW;
@@ -454,26 +456,46 @@ function findPlaceForTime(
   let preferredTypes: StepType[] = ['activity', 'cafe', 'culture', 'shopping'];
   let mealType: 'lunch' | 'dinner' | 'cafe' | undefined = undefined;
   let window: { startMinutes: number; endMinutes: number } | undefined = undefined;
+  let isMeal = false;
 
-  if (currentMinutes >= lunchWindow.startMinutes && currentMinutes <= lunchWindow.endMinutes) {
+  // Only schedule lunch if we haven't had it yet and we're in the lunch window
+  if (
+    !hasHadLunch &&
+    currentMinutes >= lunchWindow.startMinutes &&
+    currentMinutes <= lunchWindow.endMinutes
+  ) {
     preferredTypes = ['restaurant'];
     mealType = 'lunch';
     window = lunchWindow;
-  } else if (currentMinutes >= dinnerWindow.startMinutes && currentMinutes <= dinnerWindow.endMinutes) {
+    isMeal = true;
+  } 
+  // Only schedule dinner if we haven't had it yet and we're in the dinner window
+  else if (
+    !hasHadDinner &&
+    currentMinutes >= dinnerWindow.startMinutes &&
+    currentMinutes <= dinnerWindow.endMinutes
+  ) {
     preferredTypes = ['restaurant'];
     mealType = 'dinner';
     window = dinnerWindow;
-  } else if (currentMinutes > lunchWindow.endMinutes && currentMinutes < dinnerWindow.startMinutes) {
-    // Afternoon - prefer cafe break
+    isMeal = true;
+  } 
+  // Afternoon - prefer cafe break (explicitly exclude restaurants)
+  else if (currentMinutes > lunchWindow.endMinutes && currentMinutes < dinnerWindow.startMinutes) {
     preferredTypes = ['cafe', 'bakery'];
     mealType = 'cafe';
   }
+  // Default: activity/cafe/culture/shopping - explicitly exclude restaurants
+  // (restaurants should only be scheduled during meal windows when flags allow)
 
   const candidates = allPlaces.filter(
     (p) =>
       !visited.has(p.id) &&
-      (preferredTypes.includes(p.type as StepType) || p.type === 'restaurant') &&
-      (!mealType || !p.mealType || p.mealType === mealType)
+      // Strict filtering: restaurants only allowed during meal windows
+      (isMeal 
+        ? (preferredTypes.includes(p.type as StepType) && (!mealType || !p.mealType || p.mealType === mealType))
+        : (preferredTypes.includes(p.type as StepType) && p.type !== 'restaurant') // Explicitly exclude restaurants for non-meal steps
+      )
   );
 
   if (candidates.length === 0) return null;
@@ -507,6 +529,7 @@ function findPlaceForTime(
     distanceKm: nearest.distanceKm,
     startAt,
     endAt,
+    isMeal,
   };
 }
 
@@ -545,6 +568,10 @@ export function generateCourse(
   let totalDistance = 0;
   let currentPlace = startLocation;
   let currentTime = new Date(startTime);
+  
+  // Track meal states to prevent duplicate scheduling
+  let hasHadLunch = false;
+  let hasHadDinner = false;
 
   const baseDuration = intensity === 'relaxed' ? 90 : 60;
   
@@ -619,7 +646,9 @@ export function generateCourse(
           mealWindows,
           transport,
           baseDuration,
-          maxEndTime
+          maxEndTime,
+          hasHadLunch,
+          hasHadDinner
         );
 
         if (!intermediate) {
@@ -641,6 +670,19 @@ export function generateCourse(
           visited.add(anchor.id);
           currentPlace = anchor;
           currentTime = endAt;
+          
+          // Update meal flags if anchor is a restaurant during meal window
+          const currentMinutes = minutesSinceMidnight(arriveAt);
+          const lunchWindow = mealWindows?.lunch ?? DEFAULT_LUNCH_WINDOW;
+          const dinnerWindow = mealWindows?.dinner ?? DEFAULT_DINNER_WINDOW;
+          if (anchor.type === 'restaurant') {
+            if (!hasHadLunch && currentMinutes >= lunchWindow.startMinutes && currentMinutes <= lunchWindow.endMinutes) {
+              hasHadLunch = true;
+            } else if (!hasHadDinner && currentMinutes >= dinnerWindow.startMinutes && currentMinutes <= dinnerWindow.endMinutes) {
+              hasHadDinner = true;
+            }
+          }
+          
           break;
         }
 
@@ -656,6 +698,15 @@ export function generateCourse(
         visited.add(intermediate.place.id);
         currentPlace = intermediate.place;
         currentTime = intermediate.endAt;
+        
+        // Update meal flags if this was a meal
+        if (intermediate.isMeal) {
+          if (intermediate.place.mealType === 'lunch') {
+            hasHadLunch = true;
+          } else if (intermediate.place.mealType === 'dinner') {
+            hasHadDinner = true;
+          }
+        }
 
         // Check time constraint
         if (maxEndTime && currentTime >= maxEndTime) break;
@@ -678,6 +729,19 @@ export function generateCourse(
         visited.add(anchor.id);
         currentPlace = anchor;
         currentTime = endAt;
+        
+        // Update meal flags if anchor is a restaurant during meal window
+        const currentMinutes = minutesSinceMidnight(arriveAt);
+        const lunchWindow = mealWindows?.lunch ?? DEFAULT_LUNCH_WINDOW;
+        const dinnerWindow = mealWindows?.dinner ?? DEFAULT_DINNER_WINDOW;
+        if (anchor.type === 'restaurant') {
+          if (!hasHadLunch && currentMinutes >= lunchWindow.startMinutes && currentMinutes <= lunchWindow.endMinutes) {
+            hasHadLunch = true;
+          } else if (!hasHadDinner && currentMinutes >= dinnerWindow.startMinutes && currentMinutes <= dinnerWindow.endMinutes) {
+            hasHadDinner = true;
+          }
+        }
+        
         break;
       }
     }
@@ -699,7 +763,9 @@ export function generateCourse(
       mealWindows,
       transport,
       baseDuration,
-      maxEndTime
+      maxEndTime,
+      hasHadLunch,
+      hasHadDinner
     );
 
     if (!nextPlace) break;
@@ -743,6 +809,15 @@ export function generateCourse(
     visited.add(nextPlace.place.id);
     currentPlace = nextPlace.place;
     currentTime = nextPlace.endAt;
+    
+    // Update meal flags if this was a meal
+    if (nextPlace.isMeal) {
+      if (nextPlace.place.mealType === 'lunch') {
+        hasHadLunch = true;
+      } else if (nextPlace.place.mealType === 'dinner') {
+        hasHadDinner = true;
+      }
+    }
   }
 
   // Ensure end location is last if specified
