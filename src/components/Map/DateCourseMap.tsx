@@ -36,7 +36,8 @@ interface DateCourseMapProps {
   places: Place[];
   courseSequence?: Place[]; // Selected course route
   startLocation?: Place;
-  selectedPlace?: Place; // Place to center map on (from timeline click)
+  selectedPlace?: Place; // Place to center map on (from timeline click) - legacy
+  focusedLocation?: { lat: number; lng: number } | null; // Location to fly to (from card click)
 }
 
 /**
@@ -54,7 +55,7 @@ function getMarkerColor(place: Place, index: number, total: number): string {
 }
 
 /**
- * Component to handle map panning when selectedPlace changes
+ * Component to handle map panning when selectedPlace changes (legacy)
  */
 const MapPanController: React.FC<{ place?: Place }> = ({ place }) => {
   const map = useMap();
@@ -67,6 +68,25 @@ const MapPanController: React.FC<{ place?: Place }> = ({ place }) => {
       });
     }
   }, [place, map]);
+
+  return null;
+};
+
+/**
+ * MapController component to handle programmatic map movement
+ * Uses flyTo for smooth animation when focusedLocation changes
+ */
+const MapController: React.FC<{ focusedLocation?: { lat: number; lng: number } | null }> = ({ focusedLocation }) => {
+  const map = useMap();
+
+  useEffect(() => {
+    if (focusedLocation) {
+      map.flyTo([focusedLocation.lat, focusedLocation.lng], 15, {
+        animate: true,
+        duration: 1.0,
+      });
+    }
+  }, [focusedLocation, map]);
 
   return null;
 };
@@ -90,6 +110,7 @@ export const DateCourseMap: React.FC<DateCourseMapProps> = ({
   places,
   courseSequence = [],
   selectedPlace,
+  focusedLocation,
 }) => {
   const [isMounted, setIsMounted] = useState(false);
 
@@ -155,8 +176,11 @@ export const DateCourseMap: React.FC<DateCourseMapProps> = ({
         style={{ height: '100%', width: '100%' }}
         scrollWheelZoom={true}
       >
-        {/* Map pan controller - moves map when place is selected */}
+        {/* Map pan controller - moves map when place is selected (legacy) */}
         <MapPanController place={selectedPlace} />
+        
+        {/* Map controller - flies to location when card is clicked */}
+        <MapController focusedLocation={focusedLocation} />
 
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'

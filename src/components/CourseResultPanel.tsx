@@ -1,11 +1,14 @@
 import React from 'react';
-import { Clock, MapPin, Utensils, Coffee, Activity, Landmark, ShoppingBag, X } from 'lucide-react';
+import { Clock, MapPin, Utensils, Coffee, Activity, Landmark, ShoppingBag, X, ThumbsUp, RefreshCw } from 'lucide-react';
 import { Place } from '../types';
 import { CourseStep } from '../utils/courseGenerator';
 
 interface CourseResultPanelProps {
   steps: CourseStep[];
   onClose?: () => void;
+  onPlaceClick?: (place: Place) => void;
+  onLike?: (place: Place, index: number) => void;
+  onDislike?: (place: Place, index: number) => void;
 }
 
 const getPlaceIcon = (place: Place) => {
@@ -41,7 +44,13 @@ const formatDuration = (minutes: number): string => {
   return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
 };
 
-export const CourseResultPanel: React.FC<CourseResultPanelProps> = ({ steps, onClose }) => {
+export const CourseResultPanel: React.FC<CourseResultPanelProps> = ({
+  steps,
+  onClose,
+  onPlaceClick,
+  onLike,
+  onDislike,
+}) => {
   if (steps.length === 0) {
     return null;
   }
@@ -86,7 +95,10 @@ export const CourseResultPanel: React.FC<CourseResultPanelProps> = ({ steps, onC
                     : step.place.mealType === 'cafe'
                     ? 'bg-amber-50 border-amber-200'
                     : 'bg-blue-50 border-blue-200'
+                } ${
+                  onPlaceClick ? 'cursor-pointer hover:shadow-lg hover:scale-[1.02]' : ''
                 }`}
+                onClick={() => onPlaceClick?.(step.place)}
               >
                 {/* Timeline connector */}
                 {index < steps.length - 1 && (
@@ -151,11 +163,39 @@ export const CourseResultPanel: React.FC<CourseResultPanelProps> = ({ steps, onC
                     </p>
 
                     {/* Step Number */}
-                    <div className="text-xs text-gray-400">
+                    <div className="text-xs text-gray-400 mb-2">
                       Step {index + 1} of {steps.length}
                       {isStart && ' • Start'}
                       {isEnd && ' • End'}
                     </div>
+
+                    {/* Action Buttons */}
+                    {index > 0 && (onLike || onDislike) && (
+                      <div className="mt-3 pt-3 border-t border-gray-200 flex items-center gap-2">
+                        <button
+                          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-green-50 text-green-700 border border-green-200 hover:bg-green-100 transition-all"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onLike?.(step.place, index);
+                          }}
+                          title="Like this style - AI will learn and optimize"
+                        >
+                          <ThumbsUp className="w-3.5 h-3.5" />
+                          Like
+                        </button>
+                        <button
+                          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 transition-all"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onDislike?.(step.place, index);
+                          }}
+                          title="Reroll this place"
+                        >
+                          <RefreshCw className="w-3.5 h-3.5" />
+                          Reroll
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>

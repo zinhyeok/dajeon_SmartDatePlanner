@@ -1,6 +1,6 @@
 import { Place, Companion, Transport, Intensity } from '../types';
 import { haversineDistance } from './haversine';
-import { PreferenceWeights } from './UserPreferenceModel';
+import { PreferenceWeights, UserVector, VECTOR_DIMENSIONS, placeToFeatureVector } from './UserPreferenceModel';
 
 export interface MealWindows {
   lunch?: { startMinutes: number; endMinutes: number };
@@ -9,7 +9,7 @@ export interface MealWindows {
 
 export interface CourseGenerationOptions {
   startLocation: Place;
-  userPreferences: PreferenceWeights;
+  userPreferences: PreferenceWeights | UserVector; // Support both legacy and new vector model
   weather: { temp: number; isRainy: boolean };
   startTime: Date; // Required: The course starts at this time
   endLocation?: Place | null; // Optional: The course MUST finish here
@@ -48,6 +48,17 @@ interface StepDefinition {
 }
 
 interface ScoreContext {
+  userVector: UserVector;
+  isRainy: boolean;
+  temperature: number;
+  distanceKm?: number;
+  selectedPlaces?: Place[]; // For diversity penalty calculation
+  companion?: Companion;
+  transport?: Transport;
+}
+
+// Legacy interface for backward compatibility
+interface LegacyScoreContext {
   preferences: PreferenceWeights;
   isRainy: boolean;
   temperature: number;
@@ -98,6 +109,187 @@ function calculateWeatherScore(context: ScoreContext, outdoor: boolean) {
   return score;
 }
 
+/**
+ * Calculate cosine similarity between two vectors
+ * Formula: (A · B) / (||A|| * ||B||)
+ */
+function cosineSimilarity(vecA: UserVector, vecB: UserVector): number {
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+
+  for (const dim of VECTOR_DIMENSIONS) {
+    const a = vecA[dim] || 0;
+    const b = vecB[dim] || 0;
+    dotProduct += a * b;
+    normA += a * a;
+    normB += b * b;
+  }
+
+  const denominator = Math.sqrt(normA) * Math.sqrt(normB);
+  if (denominator === 0) return 0;
+
+  return dotProduct / denominator;
+}
+
+/**
+ * Calculate diversity penalty using diminishing marginal utility
+ * Penalty = 0.6^count where count is how many times this place type has appeared
+ */
+function calculateDiversityPenalty(place: Place, selectedPlaces: Place[]): number {
+  if (!selectedPlaces || selectedPlaces.length === 0) return 1.0;
+
+  // Count how many times this place type has been selected
+  const typeCount = selectedPlaces.filter((p) => p.type === place.type).length;
+  
+  // Apply diminishing marginal utility: 0.6^count
+  // First occurrence: 1.0 (no penalty)
+  // Second occurrence: 0.6
+  // Third occurrence: 0.36
+  // etc.
+  return Math.pow(0.6, typeCount);
+}
+
+/**
+ * Calculate weather penalty (hard/soft constraints)
+ */
+function calculateWeatherPenalty(isRainy: boolean, temperature: number, isOutdoor: boolean): number {
+  let penalty = 0;
+
+  if (isRainy) {
+    penalty += isOutdoor ? -200 : 30; // Heavy penalty for outdoor in rain
+  }
+
+  if (temperature > 30 || temperature < 0) {
+    penalty += isOutdoor ? -50 : 0; // Penalty for extreme temperatures outdoors
+  }
+
+  return penalty;
+}
+
+/**
+ * Calculate distance penalty based on transport mode
+ */
+function calculateDistancePenalty(distanceKm: number, transport: Transport): number {
+  if (distanceKm === undefined) return 0;
+
+  if (transport === 'foot') {
+    // Stricter penalty for walking: max 1.5km between stops
+    if (distanceKm > 1.5) {
+      return -200; // Heavy penalty for distances > 1.5km
+    } else {
+      return -Math.max(0, (Math.exp(distanceKm / 5) - 1) * 30);
+    }
+  } else {
+    // Car: less strict distance penalty
+    return -Math.max(0, (Math.exp(distanceKm / 10) - 1) * 20);
+  }
+}
+
+/**
+ * Calculate companion-based bonus/penalty
+ */
+function calculateCompanionBonus(place: Place, companion: Companion): number {
+  const nameLower = (place.name || '').toLowerCase();
+  const placeType = place.type;
+  let bonus = 0;
+
+  if (companion === 'partner') {
+    // Boost: atmosphere, dining, bars, cafes
+    if (placeType === 'restaurant' || placeType === 'cafe' || placeType === 'bar') {
+      bonus += 30;
+    }
+    if (nameLower.includes('romantic') || nameLower.includes('date') || nameLower.includes('couple')) {
+      bonus += 40;
+    }
+    // Penalize: loud, family-oriented
+    if (nameLower.includes('family') || nameLower.includes('kids') || nameLower.includes('playground')) {
+      bonus -= 50;
+    }
+  } else if (companion === 'family') {
+    // Boost: family-friendly, indoor, safe
+    if (place.isIndoor) {
+      bonus += 20;
+    }
+    if (placeType === 'activity' || placeType === 'landmark' || placeType === 'shopping') {
+      bonus += 25;
+    }
+    // Penalize: bars, loud places, adult-only
+    if (placeType === 'bar') {
+      bonus -= 100;
+    }
+    if (nameLower.includes('bar') || nameLower.includes('pub') || nameLower.includes('club')) {
+      bonus -= 80;
+    }
+  } else if (companion === 'friend') {
+    // Boost: social places, cafes, activities
+    if (placeType === 'cafe' || placeType === 'activity' || placeType === 'shopping') {
+      bonus += 20;
+    }
+  } else if (companion === 'solo') {
+    // Boost: quiet, introspective places
+    if (placeType === 'cafe' || placeType === 'culture' || placeType === 'landmark') {
+      bonus += 15;
+    }
+  }
+
+  return bonus;
+}
+
+/**
+ * Calculate keyword-based bonus/penalty
+ */
+function calculateKeywordScore(place: Place): number {
+  const nameLower = (place.name || '').toLowerCase();
+  let score = 0;
+
+  if (KEYWORD_BONUS.some((kw) => nameLower.includes(kw))) {
+    score += 20;
+  }
+  if (CHAIN_PENALTY.some((kw) => nameLower.includes(kw))) {
+    score -= 100;
+  }
+
+  return score;
+}
+
+/**
+ * Calculate place score using vector-based cosine similarity + diversity penalty
+ * This is the new core scoring function
+ */
+export function calculatePlaceScore(
+  place: Place,
+  context: ScoreContext
+): number {
+  // Step A: Feature Vectorization
+  const placeVector = placeToFeatureVector(place);
+
+  // Step B: Cosine Similarity (The Core Score)
+  // Result is 0.0 ~ 1.0, scale to 0-100 for consistency
+  const similarityScore = cosineSimilarity(context.userVector, placeVector);
+  let baseScore = similarityScore * 100;
+
+  // Step C: Marginal Utility (Diversity Penalty)
+  const diversityMultiplier = calculateDiversityPenalty(place, context.selectedPlaces || []);
+  baseScore *= diversityMultiplier;
+
+  // Step D: Weather Constraint (Keep existing)
+  const outdoor = !isIndoor(place);
+  const weatherPenalty = calculateWeatherPenalty(context.isRainy, context.temperature, outdoor);
+  baseScore += weatherPenalty;
+
+  // Additional factors
+  baseScore += calculateKeywordScore(place);
+  baseScore += calculateDistancePenalty(context.distanceKm || 0, context.transport || 'foot');
+  
+  if (context.companion) {
+    baseScore += calculateCompanionBonus(place, context.companion);
+  }
+
+  return baseScore;
+}
+
+// Legacy function for backward compatibility
 function preferenceMultiplier(tags: string[], prefs: PreferenceWeights) {
   if (tags.length === 0) return 1;
   const weights = tags.map((t) => prefs[t] ?? 1);
@@ -107,14 +299,12 @@ function preferenceMultiplier(tags: string[], prefs: PreferenceWeights) {
   return Math.max(0.2, amplified);
 }
 
-interface CompanionContext {
-  companion?: Companion;
-  transport?: Transport;
-}
-
-export function calculatePlaceScore(
+/**
+ * Legacy calculatePlaceScore for backward compatibility
+ */
+function calculatePlaceScoreLegacy(
   place: Place,
-  context: ScoreContext,
+  context: LegacyScoreContext,
   companionContext?: CompanionContext
 ): number {
   let score = 100;
@@ -199,6 +389,29 @@ export function calculatePlaceScore(
   return score;
 }
 
+// Helper function to check if preferences is UserVector or legacy PreferenceWeights
+function isUserVector(prefs: PreferenceWeights | UserVector): prefs is UserVector {
+  return VECTOR_DIMENSIONS.every((dim) => dim in prefs);
+}
+
+// Convert legacy PreferenceWeights to UserVector
+function convertToUserVector(prefs: PreferenceWeights | UserVector): UserVector {
+  if (isUserVector(prefs)) {
+    return prefs;
+  }
+  // Convert legacy preferences to vector (simple mapping)
+  const vector: UserVector = { ...INITIAL_USER_VECTOR };
+  // Map legacy tags to vector dimensions where possible
+  if (prefs.Meat !== undefined) vector.Meat = Math.min(1.0, prefs.Meat);
+  if (prefs.Seafood !== undefined) vector.Seafood = Math.min(1.0, prefs.Seafood);
+  if (prefs.Quiet !== undefined) vector.Quiet = Math.min(1.0, prefs.Quiet);
+  if (prefs.Active !== undefined) vector.Active = Math.min(1.0, prefs.Active);
+  if (prefs.Indoor !== undefined) vector.Indoor = Math.min(1.0, prefs.Indoor);
+  if (prefs.Outdoor !== undefined) vector.Nature = Math.min(1.0, prefs.Outdoor);
+  if (prefs.Gourmet !== undefined) vector.Luxury = Math.min(1.0, prefs.Gourmet);
+  return vector;
+}
+
 function travelMinutes(distanceKm: number, transport: Transport = 'foot'): number {
   if (transport === 'car') {
     // Car: ~3 minutes per km (faster), but add parking time
@@ -242,7 +455,7 @@ function pickCandidate(
   step: StepDefinition,
   context: {
     visited: Set<string>;
-    preferences: PreferenceWeights;
+    userVector: UserVector;
     isRainy: boolean;
     temperature: number;
     currentTime: Date;
@@ -250,6 +463,7 @@ function pickCandidate(
     lockedSteps?: Record<number, Place>;
     transport?: Transport;
     companion?: Companion;
+    selectedPlaces?: Place[]; // For diversity penalty
   }
 ): { place: Place; distanceKm: number; startAt: Date; endAt: Date } | null {
   const locked = context.lockedSteps?.[stepIndex + 1]; // +1 because sequence includes start at 0
@@ -299,17 +513,16 @@ function pickCandidate(
     if (!windowCheck.ok) continue;
 
     const endAt = addMinutes(windowCheck.startAt, place.estimatedDuration || 60);
-    const tags = tagsForPlace(place);
+    
+    // Use new vector-based scoring with diversity penalty
     const score = calculatePlaceScore(
       place,
       {
-        preferences: context.preferences,
+        userVector: context.userVector,
         isRainy: context.isRainy,
         temperature: context.temperature,
         distanceKm,
-        tags,
-      },
-      {
+        selectedPlaces: context.selectedPlaces || [],
         companion: context.companion,
         transport: context.transport,
       }
@@ -435,6 +648,7 @@ function findNearestPlace(
 
 /**
  * Find a place suitable for the current time (meal type matching)
+ * Uses vector-based scoring with diversity penalty
  */
 function findPlaceForTime(
   currentTime: Date,
@@ -446,7 +660,12 @@ function findPlaceForTime(
   baseDuration: number,
   maxEndTime: Date | null,
   hasHadLunch: boolean,
-  hasHadDinner: boolean
+  hasHadDinner: boolean,
+  userVector: UserVector,
+  selectedPlaces: Place[],
+  companion?: Companion,
+  isRainy?: boolean,
+  temperature?: number
 ): { place: Place; distanceKm: number; startAt: Date; endAt: Date; isMeal: boolean } | null {
   const currentMinutes = minutesSinceMidnight(currentTime);
   const lunchWindow = mealWindows?.lunch ?? DEFAULT_LUNCH_WINDOW;
@@ -500,35 +719,59 @@ function findPlaceForTime(
 
   if (candidates.length === 0) return null;
 
-  // Find nearest suitable place
-  const nearest = findNearestPlace(from, candidates, visited, transport);
-  if (!nearest) return null;
+  // Score all candidates and pick the best one (not just nearest)
+  let best: { place: Place; distanceKm: number; startAt: Date; endAt: Date; score: number } | null = null;
 
-  const travelTime = travelMinutes(nearest.distanceKm, transport);
-  const arriveAt = addMinutes(currentTime, travelTime);
+  for (const place of candidates) {
+    const distanceKm = haversineDistance(from.lat, from.lng, place.lat, place.lng);
 
-  // Validate time window if meal time
-  let startAt = arriveAt;
-  if (window) {
-    const arriveMinutes = minutesSinceMidnight(arriveAt);
-    if (arriveMinutes > window.endMinutes) return null; // Too late
-    const startMinutes = Math.max(arriveMinutes, window.startMinutes);
-    startAt = new Date(arriveAt);
-    startAt.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
+    // Filter by transport constraints
+    if (transport === 'foot' && distanceKm > 1.5) continue;
+
+    const travelTime = travelMinutes(distanceKm, transport);
+    const arriveAt = addMinutes(currentTime, travelTime);
+
+    // Validate time window if meal time
+    let startAt = arriveAt;
+    if (window) {
+      const arriveMinutes = minutesSinceMidnight(arriveAt);
+      if (arriveMinutes > window.endMinutes) continue; // Too late
+      const startMinutes = Math.max(arriveMinutes, window.startMinutes);
+      startAt = new Date(arriveAt);
+      startAt.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
+    }
+
+    const endAt = addMinutes(startAt, place.estimatedDuration || baseDuration);
+
+    // Hard constraint: Check if this place would exceed duration limit
+    if (maxEndTime && endAt > maxEndTime) continue;
+
+    // Calculate score using vector-based model
+    const score = calculatePlaceScore(
+      place,
+      {
+        userVector,
+        isRainy: isRainy ?? false,
+        temperature: temperature ?? 20,
+        distanceKm,
+        selectedPlaces,
+        companion,
+        transport,
+      }
+    );
+
+    if (!best || score > best.score) {
+      best = { place, distanceKm, startAt, endAt, score };
+    }
   }
 
-  const endAt = addMinutes(startAt, nearest.place.estimatedDuration || baseDuration);
-
-  // Hard constraint: Check if this place would exceed duration limit
-  if (maxEndTime && endAt > maxEndTime) {
-    return null; // Would exceed duration
-  }
+  if (!best) return null;
 
   return {
-    place: nearest.place,
-    distanceKm: nearest.distanceKm,
-    startAt,
-    endAt,
+    place: best.place,
+    distanceKm: best.distanceKm,
+    startAt: best.startAt,
+    endAt: best.endAt,
     isMeal,
   };
 }
@@ -555,6 +798,9 @@ export function generateCourse(
 
   if (!startLocation) return null;
 
+  // Convert userPreferences to UserVector (supports both legacy and new format)
+  const userVector = convertToUserVector(userPreferences);
+
   const sequence: Place[] = [startLocation];
   const courseSteps: CourseStep[] = [
     {
@@ -565,6 +811,7 @@ export function generateCourse(
     },
   ];
   const visited = new Set<string>([startLocation.id]);
+  const selectedPlaces: Place[] = [startLocation]; // Track selected places for diversity penalty
   let totalDistance = 0;
   let currentPlace = startLocation;
   let currentTime = new Date(startTime);
@@ -648,7 +895,12 @@ export function generateCourse(
           baseDuration,
           maxEndTime,
           hasHadLunch,
-          hasHadDinner
+          hasHadDinner,
+          userVector,
+          selectedPlaces,
+          companion,
+          weather.isRainy,
+          weather.temp
         );
 
         if (!intermediate) {
@@ -688,6 +940,7 @@ export function generateCourse(
 
         // Add intermediate place
         sequence.push(intermediate.place);
+        selectedPlaces.push(intermediate.place); // Track for diversity
         courseSteps.push({
           place: intermediate.place,
           startTime: intermediate.startAt,
@@ -719,6 +972,7 @@ export function generateCourse(
         if (maxEndTime && endAt > maxEndTime) break;
 
         sequence.push(anchor);
+        selectedPlaces.push(anchor); // Track for diversity
         courseSteps.push({
           place: anchor,
           startTime: arriveAt,
@@ -765,7 +1019,12 @@ export function generateCourse(
       baseDuration,
       maxEndTime,
       hasHadLunch,
-      hasHadDinner
+      hasHadDinner,
+      userVector,
+      selectedPlaces,
+      companion,
+      weather.isRainy,
+      weather.temp
     );
 
     if (!nextPlace) break;
@@ -799,6 +1058,7 @@ export function generateCourse(
     }
 
     sequence.push(nextPlace.place);
+    selectedPlaces.push(nextPlace.place); // Track for diversity
     courseSteps.push({
       place: nextPlace.place,
       startTime: nextPlace.startAt,

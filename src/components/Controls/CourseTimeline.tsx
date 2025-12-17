@@ -142,28 +142,25 @@ export const CourseTimeline: React.FC<CourseTimelineProps> = ({
                   {index > 0 && (onLike || onDislike) && (
                     <div className="mt-3 pt-3 border-t border-gray-100 flex items-center gap-2">
                       <button
-                        className="text-xs px-2 py-1 rounded bg-green-50 text-green-700 border border-green-200 hover:bg-green-100"
+                        className="text-xs px-2 py-1 rounded bg-green-50 text-green-700 border border-green-200 hover:bg-green-100 transition-all"
                         onClick={(e) => {
                           e.stopPropagation();
                           onLike?.(place, index);
                         }}
-                        disabled={lockedSteps?.has(index)}
+                        title="Like this style - AI will learn and optimize"
                       >
                         👍 Like
                       </button>
                       <button
-                        className="text-xs px-2 py-1 rounded bg-red-50 text-red-700 border border-red-200 hover:bg-red-100"
+                        className="text-xs px-2 py-1 rounded bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 transition-all"
                         onClick={(e) => {
                           e.stopPropagation();
                           onDislike?.(place, index);
                         }}
-                        disabled={lockedSteps?.has(index)}
+                        title="Reroll this place"
                       >
                         👎 Reroll
                       </button>
-                      {lockedSteps?.has(index) && (
-                        <span className="text-[11px] text-indigo-600 font-medium">Locked</span>
-                      )}
                     </div>
                   )}
                 </div>

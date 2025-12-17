@@ -15,7 +15,7 @@ import {
   DEFAULT_LUNCH_WINDOW,
   DEFAULT_DINNER_WINDOW,
 } from './utils/courseGenerator';
-import { INITIAL_PREFERENCES, updatePreference, PreferenceWeights, extractTagsFromPlace } from './utils/UserPreferenceModel';
+import { INITIAL_USER_VECTOR, updateUserVector, UserVector, VECTOR_DIMENSIONS, placeToFeatureVector } from './utils/UserPreferenceModel';
 import { fetchCurrentWeather } from './utils/weatherApi';
 import { Place, Theme, Companion, Transport, Intensity } from './types';
 import { MealTimeControls } from './components/Controls/MealTimeControls';
@@ -75,7 +75,7 @@ function App() {
   const [isRainy, setIsRainy] = useState(false);
   const [temperature, setTemperature] = useState(20);
   const [useLiveWeather, setUseLiveWeather] = useState(false);
-  const [preferences, setPreferences] = useState<PreferenceWeights>(INITIAL_PREFERENCES);
+  const [userVector, setUserVector] = useState<UserVector>(INITIAL_USER_VECTOR);
   const [lockedSteps, setLockedSteps] = useState<Record<number, Place>>({});
   const [course, setCourse] = useState<GeneratedCourse | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -94,6 +94,7 @@ function App() {
   const [lockedPlaces, setLockedPlaces] = useState<Place[]>([]);
   const [endLocation, setEndLocation] = useState<Place | null>(null);
   const [endTime, setEndTime] = useState<Date | null>(null);
+  const [focusedLocation, setFocusedLocation] = useState<{ lat: number; lng: number } | null>(null);
 
   const [startTime, setStartTime] = useState<Date>(() => {
     const now = new Date();
@@ -182,7 +183,7 @@ function App() {
       try {
         const generated = generateCourse(places, {
           startLocation,
-          userPreferences: preferences,
+          userPreferences: userVector,
           weather: { temp: temperature, isRainy },
           startTime,
           endLocation: endLocation || undefined,
@@ -326,23 +327,21 @@ function App() {
 
               {/* AI Status */}
               <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-700">
-                <p className="font-semibold text-slate-900 mb-1">AI Learning</p>
+                <p className="font-semibold text-slate-900 mb-1">AI Learning (Vector Model)</p>
                 <p>
                   Prefers:{' '}
-                  {Object.entries(preferences)
-                    .filter(([, w]) => w > 1.05)
-                    .sort((a, b) => b[1] - a[1])
+                  {VECTOR_DIMENSIONS.filter((dim) => userVector[dim] > 0.6)
+                    .sort((a, b) => userVector[b] - userVector[a])
                     .slice(0, 2)
-                    .map(([k, v]) => `${k} (${v.toFixed(2)}x)`)
+                    .map((dim) => `${dim} (${userVector[dim].toFixed(2)})`)
                     .join(', ') || 'None yet'}
                 </p>
                 <p>
                   Avoids:{' '}
-                  {Object.entries(preferences)
-                    .filter(([, w]) => w < 0.95)
-                    .sort((a, b) => a[1] - b[1])
+                  {VECTOR_DIMENSIONS.filter((dim) => userVector[dim] < 0.4)
+                    .sort((a, b) => userVector[a] - userVector[b])
                     .slice(0, 2)
-                    .map(([k, v]) => `${k} (${v.toFixed(2)}x)`)
+                    .map((dim) => `${dim} (${userVector[dim].toFixed(2)})`)
                     .join(', ') || 'None yet'}
                 </p>
                 {recentBoosts.length > 0 && (
@@ -416,34 +415,36 @@ function App() {
               startTime={startTime}
               onPlaceClick={setSelectedPlace}
               onLike={(place, idx) => {
-                const prevPrefs = preferences;
-                const nextPrefs = updatePreference(place, 'LIKE', prevPrefs);
-                const boosts = extractTagsFromPlace(place)
-                  .map((tag) => {
-                    const diff = (nextPrefs[tag] ?? 1) - (prevPrefs[tag] ?? 1);
-                    return diff > 0 ? `${tag} +${diff.toFixed(2)}` : null;
+                const prevVector = userVector;
+                const nextVector = updateUserVector(place, 'LIKE', prevVector);
+                const placeVector = placeToFeatureVector(place);
+                
+                // Calculate boosts for dimensions that were updated
+                const boosts = VECTOR_DIMENSIONS.filter((dim) => placeVector[dim] > 0)
+                  .map((dim) => {
+                    const diff = nextVector[dim] - prevVector[dim];
+                    return diff > 0 ? `${dim} +${diff.toFixed(2)}` : null;
                   })
                   .filter(Boolean) as string[];
 
-                const nextLocked = idx > 0 ? { ...lockedSteps, [idx]: place } : { ...lockedSteps };
-
-                setPreferences(nextPrefs);
-                setLockedSteps(nextLocked);
+                // Update user preferences (training only, no locking)
+                setUserVector(nextVector);
                 setRecentBoosts(boosts);
-                setToastMessage('AI learned your taste! Re-optimizing remaining steps...');
+                setToastMessage('AI learned your taste! Re-optimizing course...');
                 setIsGenerating(true);
 
                 setTimeout(() => {
                   try {
+                    // Regenerate entire course with new preferences (no locked steps)
                     const generated = generateCourse(places, {
                       startLocation: startLocation || places[0],
-                      userPreferences: nextPrefs,
+                      userPreferences: nextVector,
                       weather: { temp: temperature, isRainy },
                       startTime,
                       endLocation: endLocation || undefined,
                       endTime: endTime || undefined,
                       mustVisitPlaces: lockedPlaces.length > 0 ? lockedPlaces : undefined,
-                      lockedSteps: nextLocked,
+                      lockedSteps: undefined, // No locking - let AI optimize freely
                       mealWindows,
                       companion,
                       transport,
@@ -464,25 +465,23 @@ function App() {
                 }, 50);
               }}
               onDislike={(place, idx) => {
-                const nextPrefs = updatePreference(place, 'DISLIKE', preferences);
-                setPreferences(nextPrefs);
-                const nextLocked = { ...lockedSteps };
-                delete nextLocked[idx];
-                setLockedSteps(nextLocked);
+                const nextVector = updateUserVector(place, 'DISLIKE', userVector);
+                setUserVector(nextVector);
 
                 setIsGenerating(true);
                 setTimeout(() => {
                   try {
+                    // Remove this place from consideration and regenerate
                     const filtered = places.filter((p) => p.id !== place.id);
                     const generated = generateCourse(filtered, {
                       startLocation: startLocation || filtered[0],
-                      userPreferences: nextPrefs,
+                      userPreferences: nextVector,
                       weather: { temp: temperature, isRainy },
                       startTime,
                       endLocation: endLocation || undefined,
                       endTime: endTime || undefined,
                       mustVisitPlaces: lockedPlaces.length > 0 ? lockedPlaces : undefined,
-                      lockedSteps: nextLocked,
+                      lockedSteps: undefined, // No locking
                       mealWindows,
                       companion,
                       transport,
@@ -501,14 +500,105 @@ function App() {
                   }
                 }, 50);
               }}
-              lockedSteps={new Set(Object.keys(lockedSteps).map((k) => Number(k)))}
             />
           </div>
         </aside>
 
         {/* Middle - Course Result Panel (Conditional) */}
         {course && course.steps && course.steps.length > 0 && (
-          <CourseResultPanel steps={course.steps} />
+          <CourseResultPanel
+            steps={course.steps}
+            onPlaceClick={(place) => {
+              setFocusedLocation({ lat: place.lat, lng: place.lng });
+              setSelectedPlace(place);
+            }}
+            onLike={(place, index) => {
+              const prevVector = userVector;
+              const nextVector = updateUserVector(place, 'LIKE', prevVector);
+              const placeVector = placeToFeatureVector(place);
+              
+              // Calculate boosts for dimensions that were updated
+              const boosts = VECTOR_DIMENSIONS.filter((dim) => placeVector[dim] > 0)
+                .map((dim) => {
+                  const diff = nextVector[dim] - prevVector[dim];
+                  return diff > 0 ? `${dim} +${diff.toFixed(2)}` : null;
+                })
+                .filter(Boolean) as string[];
+
+              // Update user preferences (training only, no locking)
+              setUserVector(nextVector);
+              setRecentBoosts(boosts);
+              setToastMessage('AI learned your taste! Re-optimizing course...');
+              setIsGenerating(true);
+
+              setTimeout(() => {
+                try {
+                  // Regenerate entire course with new preferences (no locked steps)
+                  const generated = generateCourse(places, {
+                    startLocation: startLocation || places[0],
+                    userPreferences: nextVector,
+                    weather: { temp: temperature, isRainy },
+                    startTime,
+                    endLocation: endLocation || undefined,
+                    endTime: endTime || undefined,
+                    mustVisitPlaces: lockedPlaces.length > 0 ? lockedPlaces : undefined,
+                    lockedSteps: undefined, // No locking - let AI optimize freely
+                    mealWindows,
+                    companion,
+                    transport,
+                    intensity,
+                    duration,
+                  });
+                  if (generated) {
+                    setCourse(generated);
+                  } else {
+                    setError('Could not re-optimize the course after like.');
+                  }
+                } catch (err) {
+                  setError('An error occurred while re-optimizing.');
+                } finally {
+                  setIsGenerating(false);
+                  setTimeout(() => setToastMessage(null), 1500);
+                }
+              }, 50);
+            }}
+            onDislike={(place, index) => {
+              const nextVector = updateUserVector(place, 'DISLIKE', userVector);
+              setUserVector(nextVector);
+
+              setIsGenerating(true);
+              setTimeout(() => {
+                try {
+                  // Remove this place from consideration and regenerate
+                  const filtered = places.filter((p) => p.id !== place.id);
+                  const generated = generateCourse(filtered, {
+                    startLocation: startLocation || filtered[0],
+                    userPreferences: nextVector,
+                    weather: { temp: temperature, isRainy },
+                    startTime,
+                    endLocation: endLocation || undefined,
+                    endTime: endTime || undefined,
+                    mustVisitPlaces: lockedPlaces.length > 0 ? lockedPlaces : undefined,
+                    lockedSteps: undefined, // No locking
+                    mealWindows,
+                    companion,
+                    transport,
+                    intensity,
+                    duration,
+                  });
+                  if (generated) {
+                    setCourse(generated);
+                  } else {
+                    setError('Could not reroll this step. Try again.');
+                  }
+                } catch (err) {
+                  setError('An error occurred while rerolling.');
+                } finally {
+                  setIsGenerating(false);
+                }
+              }, 50);
+            }}
+          />
         )}
 
         {/* Right - Map */}
@@ -523,6 +613,7 @@ function App() {
               courseSequence={courseSequence}
               startLocation={startLocation || undefined}
               selectedPlace={selectedPlace || undefined}
+              focusedLocation={focusedLocation}
             />
           </Suspense>
         </main>
